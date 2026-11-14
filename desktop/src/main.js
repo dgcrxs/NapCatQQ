@@ -17,6 +17,14 @@ let tray = null
 // 复位在 createSplash() / createMainWindow() 的结尾。
 let creatingWindow = false
 
+// 登录页自愈进度：0=正常；1=已采纳 token 重载；2=已静默重启；3=已询问用户；4=放弃。
+// 用它把「连环弹框」压成一条单向流水线，进面板即复位。
+let loginHealStep = 0
+// did-finish-load 去抖定时器：一次加载只保留一个 checkLoginState 定时器
+let loginCheckTimer = null
+// 重启进行中旗标：防止多个 checkLoginState / 菜单点击并发触发多次重启
+let restarting = false
+
 function logLine(...parts) {
   try {
     const file = path.join(app.getPath('userData'), 'app.log')
@@ -204,12 +212,72 @@ function writeLaunchCmd(base, token, qqPath) {
   return cmdPath
 }
 
+/** 启动结果标记文件：wscript 是隐藏进程，只能靠落盘把 UAC 结果回传给主进程 */
+function markerPath() {
+  return path.join(app.getPath('userData'), 'launch-marker.txt')
+}
+
+/** VBScript 字符串字面量：内容里的 " 要写成 "" */
+function vbStr(value) {
+  return `"${String(value).replace(/"/g, '""')}"`
+}
+
+/**
+ * 把「提权 + 隐藏控制台」的启动器写成 VBS，再用 wscript 执行。
+ *
+ * 为什么不再用 PowerShell 的 `Start-Process -Verb RunAs -WindowStyle Minimized`：
+ * 带 -Verb RunAs 时 ShellExecute 会忽略 WindowStyle，cmd 以**可见**状态弹出，
+ * 每次启动都在桌面上留一个黑窗口，而且这些提权启动器不会自己退出，
+ * 历次重启残留下来就是一堆 cmd.exe。
+ *
+ * 改用 VBScript 的 Shell.Application.ShellExecute(cmd, args, dir, "runas", show)：
+ * 第 5 个参数就是 show 状态，0 = SW_HIDE（控制台完全不可见）。
+ * NapCat 自己的输出去向不变，仍然写进 launch.log（start-napcat.cmd 里已重定向）。
+ *
+ * @param {string} cmdPath start-napcat.cmd 绝对路径
+ * @param {string} base NapCat 目录，作为提权进程的工作目录
+ * @param {number} showFlag 0 = 隐藏（默认）；7 = 最小化可见（调试逃生用）
+ * @returns {string} vbs 文件绝对路径
+ */
+function writeLaunchVbs(cmdPath, base, showFlag = 0) {
+  const vbsPath = path.join(app.getPath('userData'), 'launch-hidden.vbs')
+  const marker = markerPath()
+  const lines = [
+    'On Error Resume Next',
+    `marker = ${vbStr(marker)}`,
+    'Set fso = CreateObject("Scripting.FileSystemObject")',
+    'Set ts = fso.CreateTextFile(marker, True)',
+    'ts.WriteLine "pending"',
+    'ts.Close',
+    'Set sh = CreateObject("Shell.Application")',
+    // Err 不会被每条语句自动清空，先清一次，下面判断的才是 ShellExecute 的结果
+    'Err.Clear',
+    `sh.ShellExecute "cmd.exe", "/c ""${cmdPath}""", ${vbStr(base)}, "runas", ${showFlag}`,
+    'Set ts = fso.CreateTextFile(marker, True)',
+    'If Err.Number <> 0 Then',
+    '  ts.WriteLine "cancelled:" & Err.Number',
+    'Else',
+    '  ts.WriteLine "ok"',
+    'End If',
+    'ts.Close',
+    '',
+  ]
+  try {
+    fs.mkdirSync(path.dirname(vbsPath), { recursive: true })
+    fs.writeFileSync(vbsPath, lines.join('\r\n'), 'utf-8')
+  } catch (e) {
+    logLine('writeLaunchVbs failed:', String(e))
+  }
+  logLine('writeLaunchVbs ->', vbsPath, 'showFlag=', String(showFlag))
+  return vbsPath
+}
+
 /**
  * 以管理员身份启动 NapCat（注入 QQ）。返回 { ok, error }
  *
  * 提权对象是 cmd 壳而不是 NapCatWinBootMain.exe：这样环境变量在提权后的会话里
- * 才能生效。用 -WindowStyle Minimized 而非 Hidden —— 要给 NapCat 留一个真实的
- * 控制台句柄，Hidden 会让它的 console 输出失效。
+ * 才能生效（UAC 创建的新进程不继承父进程刚设的 $env:NAPCAT_*）。
+ * 提权由 launch-hidden.vbs 的 ShellExecute("runas", 0) 完成，控制台不可见。
  */
 function startNapCat(base, qqPath, token) {
   return new Promise((resolve) => {
@@ -222,28 +290,90 @@ function startNapCat(base, qqPath, token) {
     }
 
     const cmdPath = writeLaunchCmd(base, token, qqPath)
-    const arg = cmdPath.includes(' ') ? `"${cmdPath}"` : cmdPath
-    const ps = `Start-Process -FilePath $env:ComSpec -ArgumentList '/c','${arg}' -Verb RunAs -WindowStyle Minimized`
-    // 日志里 token 只记长度，避免密钥落盘
-    logLine('startNapCat: ps=', ps, 'tokenLen=', String(token || '').length)
+    // 逃生开关：个别机器上隐藏控制台会让注入后的 QQ 窗口也不可见，
+    // 此时勾选菜单「启动时显示控制台窗口（调试用）」→ showFlag=7（最小化可见）。
+    const showFlag = loadSettings().showConsole === true ? 7 : 0
+    const vbsPath = writeLaunchVbs(cmdPath, base, showFlag)
+    const marker = markerPath()
+    // 先删掉上一次的 marker，避免把旧的 ok 当成本次结果
+    try {
+      fs.rmSync(marker, { force: true })
+    } catch {
+      /* ignore */
+    }
 
+    // 日志里 token 只记长度，避免密钥落盘
+    logLine('startNapCat: vbs=', vbsPath, 'showFlag=', String(showFlag), 'tokenLen=', String(token || '').length)
+
+    const fallbackToPowerShell = () => {
+      // 极少数机器上脚本宿主被安全软件禁用：退回 PowerShell 提权（会重新出现
+      // cmd 窗口，但至少能启动）。环境变量仍在 cmd 内部设置，不会丢。
+      const ps = `Start-Process -FilePath $env:ComSpec -ArgumentList '/c','${cmdPath}' -Verb RunAs -WindowStyle Minimized`
+      logLine('startNapCat: vbs launcher unavailable, fallback to PowerShell')
+      execFile(
+        'powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+        { windowsHide: true },
+        (err2, _out2, stderr2) => {
+          if (err2) {
+            const cancelled = /cancell?ed|1312|操作已被取消/i.test(`${stderr2} ${err2.message}`)
+            return resolve({
+              ok: false,
+              error: cancelled
+                ? '已取消管理员授权（NapCat 需要管理员权限注入 QQ）'
+                : `启动失败：${stderr2 || err2.message}`,
+            })
+          }
+          resolve({ ok: true })
+        }
+      )
+    }
+
+    execFile('wscript.exe', [vbsPath], { windowsHide: true }, (err, _stdout, stderr) => {
+      if (err) {
+        logLine('startNapCat: vbs exec failed, msg=', err.message, 'stderr=', stderr || '')
+        // 进程都起不来 → 用兜底方案；UAC 被取消是 marker 里体现，不走这里
+        fallbackToPowerShell()
+        return
+      }
+      // wscript 是隐藏进程、没有输出通道，UAC 结果只能读 marker：
+      // pending = 弹窗还没结束；cancelled:<err> = 用户点了「否」；ok = 已提交提权
+      let text = ''
+      try {
+        text = fs.readFileSync(marker, 'utf-8').trim()
+      } catch {
+        text = ''
+      }
+      logLine('startNapCat: launcher marker=', text || '(none)')
+      if (text.startsWith('cancelled')) {
+        return resolve({ ok: false, error: '已取消管理员授权（NapCat 需要管理员权限注入 QQ）' })
+      }
+      resolve({ ok: true })
+    })
+  })
+}
+
+/**
+ * 清理历史遗留的「提权启动器」cmd 进程。
+ *
+ * 每个提权启动器都会留一个 cmd.exe 挂在 start-napcat.cmd 上不退出，堆多了
+ * 任务管理器里就是一排黑窗口。这里只杀命令行含 start-napcat.cmd 的 cmd.exe，
+ * 绝不误杀用户自己的命令行窗口。
+ */
+function killStaleLaunchers() {
+  const ps = "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object { $_.CommandLine -like '*start-napcat.cmd*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+  return new Promise((resolve) => {
     execFile(
       'powershell.exe',
       ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
       { windowsHide: true },
       (err, _stdout, stderr) => {
         if (err) {
-          logLine('startNapCat failed: stderr=', stderr || '', 'msg=', err.message)
-          const cancelled = /cancell?ed|1312|操作已被取消/i.test(`${stderr} ${err.message}`)
-          return resolve({
-            ok: false,
-            error: cancelled
-              ? '已取消管理员授权（NapCat 需要管理员权限注入 QQ）'
-              : `启动失败：${stderr || err.message}`,
-          })
+          logLine('killStaleLaunchers: failed, msg=', err.message, 'stderr=', stderr || '')
+        } else {
+          logLine('killStaleLaunchers: done')
         }
-        logLine('startNapCat: launcher shell started')
-        resolve({ ok: true })
+        resolve()
       }
     )
   })
@@ -323,13 +453,21 @@ function createMainWindow(url) {
 
   mainWindow.on('closed', () => {
     logLine('main window closed')
+    // 窗口没了，挂着的自愈定时器要清掉，否则会对着已销毁的 webContents 执行脚本
+    clearTimeout(loginCheckTimer)
+    loginCheckTimer = null
+    loginHealStep = 0
     mainWindow = null
   })
   mainWindow.webContents.on('did-finish-load', () => logLine('did-finish-load'))
   mainWindow.webContents.on('render-process-gone', (_e, d) => logLine('render gone', JSON.stringify(d)))
 
   mainWindow.webContents.on('did-finish-load', () => {
-    setTimeout(() => {
+    // 去抖：一次启动里页面可能连续 did-finish-load 多次（重定向 + 站内路由），
+    // 每次都排一个定时器会变成「多个 checkLoginState 并发弹框」，必须先清掉旧的。
+    clearTimeout(loginCheckTimer)
+    loginCheckTimer = setTimeout(() => {
+      loginCheckTimer = null
       checkLoginState()
     }, 3500)
     if (process.argv.includes('--shot')) {
@@ -411,6 +549,10 @@ async function boot() {
 
   createSplash()
   setSplashStatus('正在检查 QQ 状态…', '需要管理员权限注入 QQ，请在弹窗中确认')
+
+  // WebUI 没起来 ⇒ 当前没有正在运行的 NapCat，此时清理历史遗留的提权启动器
+  // cmd.exe 是安全的（不会误伤运行中的实例），任务管理器里那排黑窗口也是它们。
+  await killStaleLaunchers()
 
   // resolveQQPath / isQQRunning 互不依赖，并行执行省掉一次串行等待
   const [qqPath, qqRunning] = await Promise.all([resolveQQPath(), isQQRunning()])
@@ -505,67 +647,161 @@ function currentUrl() {
   }
 }
 
-/** 页面落到登录页时提示：说明运行实例的 token 与桌面端接管的不一致 */
+/** 页面落到登录页时自愈：采纳真实 token → 静默重启一次 → 最后才问用户一次 */
 async function checkLoginState() {
   if (!mainWindow || mainWindow.isDestroyed()) return
+  if (restarting) {
+    logLine('checkLoginState: skipped (restarting)')
+    return
+  }
   const p = await mainWindow.webContents
     .executeJavaScript('location.pathname + location.search')
     .catch(() => '')
-  logLine('checkLoginState path=', p)
-  if (!p.includes('web_login')) return
-  const choice = dialog.showMessageBoxSync(mainWindow, {
-    type: 'info',
-    title: '需要接管登录凭证',
-    message: '当前运行的 NapCat 使用的是旧 WebUI 密码，桌面端无法自动登录。',
-    detail:
-      '点「重启 NapCat」后，桌面端会用自己的凭证重新拉起 QQ 与 NapCat，之后每次都能直接进入面板（需要确认一次管理员授权）。',
-    buttons: ['重启 NapCat（推荐）', '暂时忽略'],
-    defaultId: 0,
-    cancelId: 1,
-  })
-  if (choice === 0) restartNapCat()
-}
+  logLine('checkLoginState path=', p, 'step=', String(loginHealStep))
 
-function restartNapCat() {
-  const base = shellPath()
-  const token = effectiveToken(base)
-  const choice = dialog.showMessageBoxSync({
-    type: 'warning',
-    title: '重启 NapCat',
-    message: '将关闭当前登录的 QQ 进程并重新启动 NapCat，确定继续吗？',
-    detail: '重启后 WebUI 登录凭证将由桌面端统一接管，需要确认一次管理员授权。',
-    buttons: ['取消', '重启'],
-    defaultId: 1,
-    cancelId: 0,
-  })
-  if (choice !== 1) return
+  // 进入面板（非登录页）就复位自愈进度，下次遇到登录页又能从头自愈
+  if (!p.includes('web_login')) {
+    if (loginHealStep !== 0) logLine('checkLoginState: panel reached, heal step reset')
+    loginHealStep = 0
+    return
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) return
 
-  // 关闭 QQ → 等它退干净 → 复用统一的 startNapCat（不再复制一份提权脚本）
-  logLine('restartNapCat: killing QQ')
-  execFile('taskkill', ['/IM', 'QQ.exe', '/F'], { windowsHide: true }, async () => {
-    await new Promise((r) => setTimeout(r, 1500))
-    const qqPath = await resolveQQPath()
-    const result = await startNapCat(base, qqPath, token)
-    if (!result.ok) {
-      dialog.showErrorBox('重启失败', result.error)
+  // step 0 → 1：采纳运行实例的真实 token。
+  // NapCat 启动时会用 NAPCAT_WEBUI_SECRET_KEY 覆写 webui.json 的 token
+  // （packages/napcat-webui-backend/index.ts:128），所以 webui.json 里的 token
+  // 就是当前运行实例的真实 token，桌面端采纳它就能免重启直接进面板。
+  if (loginHealStep === 0) {
+    loginHealStep = 1
+    const base = shellPath()
+    let cfg
+    try {
+      cfg = readWebuiConfig(base)
+    } catch (e) {
+      logLine('checkLoginState: readWebuiConfig failed, skip adopt:', String(e))
       return
     }
+    saveSettings({ token: cfg.token })
+    logLine('checkLoginState: adopt token from webui.json, len=', String(cfg.token).length)
     if (!mainWindow || mainWindow.isDestroyed()) return
-    const cfg = readWebuiConfig(base)
-    // startNapCat 的 resolve 只代表「提权 cmd 壳已拉起」，NapCat 还要 20~60 秒才监听
-    // 端口。立刻 loadURL 会得到 ERR_CONNECTION_REFUSED（checkLoginState 里
-    // 「重启 NapCat（推荐）」按钮走的就是这条路径），所以这里等 WebUI 真正就绪。
-    logLine('restartNapCat: waiting for webui on port', cfg.port)
-    const ready = await waitForWebui(cfg.port)
-    if (!mainWindow || mainWindow.isDestroyed()) return
-    if (ready) {
-      mainWindow.loadURL(webuiUrl(cfg, token))
-    } else {
-      // 超时兜底：让页面自己重试，别把用户丢在错误页上干等 F5
-      logLine('restartNapCat: waitForWebui timeout, reload as fallback')
-      mainWindow.reload()
+    mainWindow.loadURL(webuiUrl(cfg, cfg.token))
+    return
+  }
+
+  // step 1 → 2：采纳 token 后仍是登录页 → 静默重启一次（只有 UAC，没有确认框）
+  if (loginHealStep === 1) {
+    loginHealStep = 2
+    logLine('checkLoginState: still login, silent restart')
+    restartNapCat({ silent: true })
+    return
+  }
+
+  // step 2 → 3：静默重启也救不回来 → 唯一一次询问用户（异步版，不阻塞主进程）
+  if (loginHealStep === 2) {
+    loginHealStep = 3
+    logLine('checkLoginState: silent restart did not help, ask user once')
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: '自动接管登录凭证失败',
+      message: '自动接管登录凭证失败，可手动重启 NapCat 再试。',
+      detail:
+        '桌面端已尝试复用运行中 NapCat 的 WebUI 密钥并静默重启过一次。若仍停留在登录页，可以手动重启 NapCat（需要确认一次管理员授权），或者先「忽略」再在面板里自行登录。',
+      buttons: ['重启 NapCat', '忽略'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    })
+    // 无论用户点什么，都不再弹第二次
+    loginHealStep = 4
+    if (response === 0) restartNapCat()
+    return
+  }
+
+  // step 4：放弃自愈，只留一条日志，绝不弹框
+  logLine('checkLoginState: heal abandoned, waiting for manual action')
+}
+
+/**
+ * 重启 NapCat：关掉 QQ → 清理残留启动器 → 重新提权注入 → 等 WebUI 就绪后重载。
+ *
+ * @param {{ silent?: boolean }} [opts] silent=true 表示自愈流程发起，跳过确认弹框
+ */
+function restartNapCat(opts = {}) {
+  const silent = opts && opts.silent === true
+  if (restarting) {
+    logLine('restartNapCat: ignored (already restarting)')
+    return
+  }
+  restarting = true
+  logLine('restartNapCat: enter silent=', String(silent))
+
+  // 所有出口统一在 finally 里复位，避免某条分支忘了复位把后续重启全锁死
+  runRestart(silent)
+    .catch((e) => logLine('restartNapCat failed:', e && e.stack ? e.stack : String(e)))
+    .finally(() => {
+      restarting = false
+      logLine('restartNapCat: exit, restarting reset')
+    })
+}
+
+/** restartNapCat 的实际流程体（不含旗标管理） */
+async function runRestart(silent) {
+  const base = shellPath()
+  const token = effectiveToken(base)
+
+  if (!silent) {
+    const choice = dialog.showMessageBoxSync({
+      type: 'warning',
+      title: '重启 NapCat',
+      message: '将关闭当前登录的 QQ 进程并重新启动 NapCat，确定继续吗？',
+      detail: '重启后 WebUI 登录凭证将由桌面端统一接管，需要确认一次管理员授权。',
+      buttons: ['取消', '重启'],
+      defaultId: 1,
+      cancelId: 0,
+    })
+    if (choice !== 1) {
+      logLine('restartNapCat: cancelled by user')
+      return
     }
+  }
+
+  // 关闭 QQ → 等它退干净 → 清理残留启动器 → 复用统一的 startNapCat
+  logLine('restartNapCat: killing QQ')
+  await new Promise((r) => {
+    execFile('taskkill', ['/IM', 'QQ.exe', '/F'], { windowsHide: true }, () => r())
   })
+  await new Promise((r) => setTimeout(r, 1500))
+  await killStaleLaunchers()
+
+  const qqPath = await resolveQQPath()
+  const result = await startNapCat(base, qqPath, token)
+  if (!result.ok) {
+    logLine('restartNapCat: startNapCat not ok:', result.error)
+    // 静默自愈流程里绝不弹框（用户取消 UAC 很正常），否则又会形成弹框风暴
+    if (!silent) dialog.showErrorBox('重启失败', result.error)
+    return
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  let cfg
+  try {
+    cfg = readWebuiConfig(base)
+  } catch (e) {
+    logLine('restartNapCat: readWebuiConfig failed:', String(e))
+    return
+  }
+  // startNapCat 的 resolve 只代表「提权启动器已提交」，NapCat 还要 20~60 秒才监听
+  // 端口。立刻 loadURL 会得到 ERR_CONNECTION_REFUSED，所以这里等 WebUI 真正就绪。
+  logLine('restartNapCat: waiting for webui on port', cfg.port)
+  const ready = await waitForWebui(cfg.port)
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (ready) {
+    mainWindow.loadURL(webuiUrl(cfg, token))
+  } else {
+    // 超时兜底：让页面自己重试，别把用户丢在错误页上干等 F5
+    logLine('restartNapCat: waitForWebui timeout, reload as fallback')
+    mainWindow.reload()
+  }
 }
 
 function buildMenu() {
@@ -600,6 +836,17 @@ function buildMenu() {
             if (res.canceled || !res.filePaths.length) return
             saveSettings({ shellPath: res.filePaths[0] })
             dialog.showMessageBoxSync({ type: 'info', message: '目录已保存，重启应用后生效。', buttons: ['好'] })
+          },
+        },
+        {
+          // 逃生开关：默认隐藏控制台（不出黑窗口）；个别机器上隐藏会让注入后的
+          // QQ 窗口也不可见，此时勾上它，启动器改为「最小化可见」
+          label: '启动时显示控制台窗口（调试用）',
+          type: 'checkbox',
+          checked: loadSettings().showConsole === true,
+          click: (item) => {
+            saveSettings({ showConsole: item.checked })
+            logLine('menu: showConsole=', String(item.checked))
           },
         },
         { type: 'separator' },
