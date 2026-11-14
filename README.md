@@ -85,3 +85,12 @@ _Modern protocol-side framework implemented based on NTQQ._
 2. 项目其余逻辑代码采用[本仓库开源许可](./LICENSE).
 
 **本仓库仅用于提高易用性，实现消息推送类功能，此外，禁止任何项目未经仓库主作者授权基于 NapCat 代码开发。使用请遵守当地法律法规，由此造成的问题由使用者和提供违规使用教程者负责。**
+
+---
+
+## 本仓库维护说明 / Maintenance Note
+
+- 上游 `NapNeko/NapCatQQ` 已遭下架（DMCA），本仓库是基于社区存档恢复的源码快照，`main` 分支保留完整提交历史。
+- 最后一个上游代码提交为 `docs: ending`（2026-11-10），对应 tag [`v4.18.42`](https://github.com/dgcrxs/NapCatQQ/releases/tag/v4.18.42)。
+- 编译产物（Windows x64 发行包）归档于 [`artifacts/`](artifacts/README.md)。
+- 后续本地修改直接提交到 `main`，构建后新的产物按 `artifacts/NapCat.Shell-<版本>-win-x64.zip` 命名归档。
