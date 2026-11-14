@@ -1,0 +1,20 @@
+{
+  "name": "napcat-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NapCat Desktop - WebUI 桌面客户端",
+  "main": "src/main.js",
+  "author": "dgcrxs",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "check": "electron . --check",
+    "icon": "node tools/make-icon.js",
+    "pack": "electron-packager . NapCat --platform=win32 --arch=x64 --icon=build/icon.ico --out=dist --overwrite --app-version=1.0.0 --win32metadata.ProductName=NapCat --win32metadata.FileDescription=NapCat Desktop"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.3.6",
+    "electron": "33.4.11",
+    "png-to-ico": "^2.1.8"
+  }
+}
